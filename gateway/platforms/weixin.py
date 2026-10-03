@@ -729,8 +729,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # Text debounce batching (Telegram pattern): iLink delivers messages individually, so rapid bursts would each
         # trigger a separate agent run. Telegram cadence and ceilings (#44883); ``0`` dispatches immediately.
         self._configure_text_batch_delays()
-        # Pure-media messages (no text) wait here for the chat's next text message.
+        # Pure-media messages (no text) wait here for the chat's next text message
+        # from the same sender (see the cache key), with a TTL so a chat that never
+        # follows up cannot grow the pool forever.
         self._pending_media_cache: Dict[str, Dict[str, list]] = {}
+        self._pending_media_ts: Dict[str, float] = {}  # cache key → last park time
         persisted = load_weixin_account(hermes_home, self._account_id) if self._account_id and not self._token else None
         if persisted:
             self._token = str(persisted.get("token") or "").strip()
@@ -864,6 +867,19 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] old poll session close failed: %s", self.name, exc)
 
+    # Pure-media pool policy: drop a parked bucket when no text from the same sender
+    # follows within this window, and cap what a single bucket may hold.
+    _MEDIA_CACHE_TTL_SECONDS = 1800.0
+    _MEDIA_CACHE_MAX_PER_KEY = 32
+
+    def _prune_media_cache(self) -> None:
+        """Drop stale buckets so a chat that never follows up cannot grow the pool forever."""
+        now = time.time()
+        stale = [k for k, ts in self._pending_media_ts.items() if now - ts >= self._MEDIA_CACHE_TTL_SECONDS]
+        for k in stale:
+            self._pending_media_ts.pop(k, None)
+            self._pending_media_cache.pop(k, None)
+
     async def _process_message_safe(self, message: Dict[str, Any]) -> None:
         try:
             await self._process_message(message)
@@ -906,16 +922,20 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # refs (files). Voice is exempt: the adapter drops the platform's STT text and lets
         # the runner transcribe centrally, so a voice message must flow through as a VOICE
         # event — never parked waiting for typed text.
-        ckey = f"weixin:{effective_chat_id}"
+        ckey = f"weixin:{effective_chat_id}:{sender_id}"
         has_voice = any(item.get("type") == ITEM_VOICE for item in item_list)
         if not text and not has_voice:
             if media_paths:
+                self._prune_media_cache()
                 bucket = self._pending_media_cache.setdefault(ckey, {"images": [], "files": []})
                 for p, mt in zip(media_paths, media_types):
                     if str(mt or "").startswith("image/"):
                         bucket["images"].append((p, mt))
                     else:
                         bucket["files"].append(p)
+                bucket["images"] = bucket["images"][-self._MEDIA_CACHE_MAX_PER_KEY:]
+                bucket["files"] = bucket["files"][-self._MEDIA_CACHE_MAX_PER_KEY:]
+                self._pending_media_ts[ckey] = time.time()
                 try:
                     await self.send(effective_chat_id, "📷 收到")
                 except Exception:
@@ -925,6 +945,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # Flush cached pure-media into this text as real attachments so gateway image
         # routing decides native-vs-text per the model's vision capability.
         bucket = self._pending_media_cache.pop(ckey, None)
+        self._pending_media_ts.pop(ckey, None)
         if bucket:
             cached_imgs = bucket.get("images", [])
             refs = [f"[Media: {p}]" for p in bucket.get("files", [])]
