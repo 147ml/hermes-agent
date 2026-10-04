@@ -32,6 +32,13 @@ class TestClassifyMedia:
         # The .dxf case: an image/* label with non-image bytes is a document, never an image.
         assert _classify("image/x-dxf", "", DXF) == "document"
         assert _classify("image/png", "", DXF) == "document"
+        # Same verdict when a plausible image filename rides along (QQ reports the
+        # upload's original_name): the bytes still decide, so the file cannot be
+        # handed to the image cache only to be rejected and dropped there.
+        assert _classify("image/png", "photo.png", DXF) == "document"
+        assert _classify("image/jpeg", "photo.jpg", DXF) == "document"
+        # ...while real image bytes with an image name stay an image.
+        assert _classify("image/png", "photo.png", PNG) == "image"
 
     def test_magic_bytes_confirm_an_unlabeled_image(self):
         assert _classify("application/octet-stream", "", PNG) == "image"

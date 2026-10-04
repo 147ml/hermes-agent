@@ -631,10 +631,18 @@ def classify_media(content_type: str, filename: str = "", raw_bytes: Optional[by
     Platform APIs occasionally mislabel uploads: a ``.dxf`` CAD file arriving as
     ``image/*`` once walked the image path, where the magic-byte check rejected it,
     and the file was silently dropped. Signals, strongest first: the file extension,
-    the magic bytes, then the reported content type as a last resort. Non-image
-    bytes labelled ``image/*`` classify as a document and are never cached as images.
+    the magic bytes, then the reported content type as a last resort — except that
+    an image filename with non-image bytes is downgraded to a document: whatever the
+    label or the name says, non-image bytes are never cached as images.
     """
     ext = Path(filename or "").suffix.lower()
+    data = raw_bytes or b""
+    # An image filename with non-image bytes must not walk the image path: QQ reports
+    # the upload's original_name, so a .dxf renamed to .png would otherwise head for
+    # the image cache, be rejected there, and end up dropped. When the bytes are
+    # available they decide; without them the extension keeps its usual priority.
+    if data and ext in _IMAGE_EXTS and not _looks_like_image(data):
+        return "document"
     if ext in _IMAGE_EXTS:
         return "image"
     if ext in _AUDIO_EXTS:
@@ -644,7 +652,6 @@ def classify_media(content_type: str, filename: str = "", raw_bytes: Optional[by
     if ext in _DOCUMENT_EXTS:
         return "document"
     reported = (content_type or "").split(";", 1)[0].strip().lower()
-    data = raw_bytes or b""
     if data:
         if _looks_like_image(data):
             return "image"
