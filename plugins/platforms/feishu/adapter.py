@@ -3140,20 +3140,24 @@ class FeishuAdapter(BasePlatformAdapter):
                     message_id=message_id, file_key=file_key, resource_type=request_type,
                 )
                 if not response or not response.success():
+                    code = getattr(response, "code", None)
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
                         message_id, file_key, request_type,
                         getattr(response, "code", "unknown"), getattr(response, "msg", "request failed"),
                     )
                     # Oversized uploads fail the single-shot download ("234037
-                    # Downloaded file size exceeds limit"); retry via ranged reads
-                    # before giving up on this request_type.
-                    raw_bytes = await self._download_feishu_resource_chunked(
+                    # Downloaded file size exceeds limit"); retry via ranged reads.
+                    # Other failures (expired token, revoked permission) cannot be
+                    # fixed by Range and would just pay an extra round trip.
+                    if code != 234037:
+                        continue
+                    raw_bytes, ranged_type = await self._download_feishu_resource_chunked(
                         message_id=message_id, file_key=file_key, resource_type=request_type,
                     )
                     if not raw_bytes:
                         continue
-                    content_type = ""
+                    content_type = ranged_type
                     filename = fallback_filename or f"{request_type}_{file_key}"
                 else:
                     raw_bytes = self._read_binary_response(response)
@@ -3190,47 +3194,51 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _download_feishu_resource_chunked(
         self, *, message_id: str, file_key: str, resource_type: str,
-    ) -> bytes:
+    ) -> tuple[bytes, str]:
         """Range fallback for resources the single-shot download refuses.
 
         Feishu caps one-shot resource downloads and answers larger files with
         234037 "Downloaded file size exceeds limit". The same endpoint honours
         ``Range``, so fetch the resource in 4MB chunks and stitch them together.
-        Returns b"" when ranged reads are unusable or fail midway.
+        Returns ``(b"", "")`` when ranged reads are unusable or fail midway;
+        otherwise the stitched bytes plus the Content-Type seen on the first
+        ranged response, so callers can label the media without a filename.
         """
         uri = f"/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
-        first, total = await self._feishu_resource_range(
+        first, total, content_type = await self._feishu_resource_range(
             uri=uri, resource_type=resource_type, start=0, end=_FEISHU_RESOURCE_CHUNK_SIZE - 1,
         )
         if not first:
-            return b""
+            return b"", ""
         if total <= 0 or len(first) >= total:
             # The server ignored Range and returned the whole body, or the file
             # fits in one chunk.
-            return first
+            return first, content_type
         chunks = bytearray(first)
         while len(chunks) < total:
             start = len(chunks)
-            piece, _ = await self._feishu_resource_range(
+            piece, _, _ = await self._feishu_resource_range(
                 uri=uri, resource_type=resource_type, start=start,
                 end=start + _FEISHU_RESOURCE_CHUNK_SIZE - 1,
             )
             if not piece:
-                return b""
+                return b"", ""
             chunks.extend(piece)
-        return bytes(chunks)
+        return bytes(chunks), content_type
 
     async def _feishu_resource_range(
         self, *, uri: str, resource_type: str, start: int, end: int,
-    ) -> tuple[bytes, int]:
-        """One ranged GET via the SDK's raw request path, returning ``(body, total_size)``.
+    ) -> tuple[bytes, int, str]:
+        """One ranged GET via the SDK's raw request path, returning ``(body, total_size, content_type)``.
 
         ``total_size`` is parsed from ``Content-Range`` (0 when the server does not
-        answer a 206). Any failure — transport error, unbound client, a JSON error
-        envelope, an unparsable range — returns ``(b"", 0)`` so callers give up cleanly.
+        answer a 206); ``content_type`` is the normalised response Content-Type, kept
+        so callers can label the media correctly. Any failure — transport error,
+        unbound client, a JSON error envelope, an unparsable range — returns
+        ``(b"", 0, "")`` so callers give up cleanly.
         """
         if not self._client:
-            return b"", 0
+            return b"", 0, ""
         request = (
             BaseRequest.builder()
             .http_method(HttpMethod.GET)
@@ -3246,14 +3254,14 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug(
                 "[Feishu] Ranged resource fetch failed for %s (bytes %d-%d)", uri, start, end, exc_info=True,
             )
-            return b"", 0
+            return b"", 0, ""
         raw = getattr(response, "raw", None)
         raw_headers = getattr(raw, "headers", None) or {}
         body = bytes(getattr(raw, "content", None) or b"")
         content_type = str(raw_headers.get("Content-Type") or raw_headers.get("content-type") or "")
         if body[:1] == b"{" and "json" in content_type.lower():
             # A 200 carrying a JSON envelope is an API error, never file content.
-            return b"", 0
+            return b"", 0, ""
         content_range = str(raw_headers.get("Content-Range") or raw_headers.get("content-range") or "")
         total = 0
         if "/" in content_range:
@@ -3263,8 +3271,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 total = 0
             if total == 0:
                 # A 206 without a usable total size cannot be stitched safely.
-                return b"", 0
-        return body, total
+                return b"", 0, ""
+        return body, total, content_type.split(";", 1)[0].strip().lower()
 
     # --- Static helpers — extension / media-type guessing ---
     @staticmethod
