@@ -128,3 +128,17 @@ class TestWeixinDownloadFailures:
         assert failures == []
         assert media_paths == ["/tmp/pic.jpg"]
         assert media_types == ["image/jpeg"]
+
+    def test_plain_text_item_is_not_a_failed_download(self):
+        # ITEM_TEXT is not in the inbound-media catalog: a plain message has nothing
+        # to download, so it must not surface an "[Attachment download failed: media]"
+        # note (the label used to poison every plain Weixin message).
+        from gateway.platforms import weixin
+
+        adapter = self._make_adapter()
+        adapter._download_media = AsyncMock(return_value=(None, ""))
+
+        failures = asyncio.run(adapter._collect_media({"type": weixin.ITEM_TEXT}, [], []))
+
+        assert failures == []
+        adapter._download_media.assert_not_called()

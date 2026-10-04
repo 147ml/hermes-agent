@@ -916,14 +916,20 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> List[str]:
         """Download one inbound media item into ``media_paths``; returns a label for each
-        item that could not be downloaded, so callers can surface it instead of dropping it."""
+        item that could not be downloaded, so callers can surface it instead of dropping it.
+
+        Items the catalog does not know (plain text, quoted text fragments) are not media
+        and yield no label: a failure note for them would contaminate every plain message.
+        """
         spec = _INBOUND_MEDIA.get(item.get("type"))
-        path, mime = await self._download_media(item, spec) if spec else (None, "")
+        if not spec:
+            return []
+        path, mime = await self._download_media(item, spec)
         if path:
             media_paths.append(path)
             media_types.append(mime)
             return []
-        return [spec[4] if spec else "media"]
+        return [spec[4]]
 
     async def _download_media(self, item: Dict[str, Any], spec: Tuple[Any, ...]) -> Tuple[Optional[str], str]:
         """Download + decrypt one inbound media item -> (cached path or None, mime). Voice is always downloaded
